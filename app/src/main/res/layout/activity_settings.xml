@@ -1,0 +1,186 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="@dimen/activity_horizontal_margin">
+
+    <!-- ===== Debug 模式开关 ===== -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:paddingTop="@dimen/activity_vertical_margin"
+        android:paddingBottom="@dimen/section_spacing"
+        android:minHeight="@dimen/button_min_height">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/settings_debug_mode"
+            android:textSize="@dimen/switch_text_size" />
+
+        <Switch
+            android:id="@+id/switchDebugMode"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content" />
+    </LinearLayout>
+
+    <!-- ===== 分隔线 ===== -->
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="@dimen/divider_height"
+        android:background="#E0E0E0" />
+
+    <!-- ===== 日志级别选择 ===== -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:paddingTop="@dimen/section_spacing"
+        android:paddingBottom="@dimen/section_spacing"
+        android:minHeight="@dimen/button_min_height">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/settings_log_level"
+            android:textSize="@dimen/switch_text_size" />
+
+        <Spinner
+            android:id="@+id/spinnerLogLevel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:minWidth="120dp" />
+    </LinearLayout>
+
+    <!-- ===== 分隔线 ===== -->
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="@dimen/divider_height"
+        android:background="#E0E0E0" />
+
+    <!-- ===== 操作按钮区域 ===== -->
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/settings_actions"
+        android:textSize="@dimen/section_title_text_size"
+        android:textColor="#888888"
+        android:paddingTop="@dimen/section_spacing"
+        android:paddingBottom="8dp"
+        android:paddingStart="4dp"
+        android:paddingEnd="4dp" />
+
+    <Button
+        android:id="@+id/btnClearDexKitCache"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:minHeight="@dimen/button_min_height"
+        android:text="@string/settings_clear_dexkit_cache"
+        android:textAllCaps="false"
+        android:layout_marginTop="4dp"
+        android:paddingTop="@dimen/button_padding_vertical"
+        android:paddingBottom="@dimen/button_padding_vertical" />
+
+    <Button
+        android:id="@+id/btnForceReloadHooks"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:minHeight="@dimen/button_min_height"
+        android:text="@string/settings_force_reload_hooks"
+        android:textAllCaps="false"
+        android:layout_marginTop="4dp"
+        android:paddingTop="@dimen/button_padding_vertical"
+        android:paddingBottom="@dimen/button_padding_vertical" />
+
+    <Button
+        android:id="@+id/btnViewLogs"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:minHeight="@dimen/button_min_height"
+        android:text="@string/settings_view_logs"
+        android:textAllCaps="false"
+        android:layout_marginTop="4dp"
+        android:paddingTop="@dimen/button_padding_vertical"
+        android:paddingBottom="@dimen/button_padding_vertical" />
+
+    <Button
+        android:id="@+id/btnHookStatus"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:minHeight="@dimen/button_min_height"
+        android:text="@string/settings_hook_status"
+        android:textAllCaps="false"
+        android:layout_marginTop="4dp"
+        android:paddingTop="@dimen/button_padding_vertical"
+        android:paddingBottom="@dimen/button_padding_vertical" />
+
+    <!-- ===== 分隔线 ===== -->
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="@dimen/divider_height"
+        android:background="#E0E0E0"
+        android:layout_marginTop="@dimen/section_spacing" />
+
+    <!-- ===== 备份管理区域 ===== -->
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/settings_backup_section"
+        android:textSize="@dimen/section_title_text_size"
+        android:textColor="#888888"
+        android:paddingTop="@dimen/section_spacing"
+        android:paddingBottom="8dp"
+        android:paddingStart="4dp"
+        android:paddingEnd="4dp" />
+
+    <Button
+        android:id="@+id/btnCreateBackup"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:minHeight="@dimen/button_min_height"
+        android:text="@string/settings_create_backup"
+        android:textAllCaps="false"
+        android:layout_marginTop="4dp"
+        android:paddingTop="@dimen/button_padding_vertical"
+        android:paddingBottom="@dimen/button_padding_vertical" />
+
+    <Button
+        android:id="@+id/btnRestoreBackup"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:minHeight="@dimen/button_min_height"
+        android:text="@string/settings_restore_backup"
+        android:textAllCaps="false"
+        android:layout_marginTop="4dp"
+        android:paddingTop="@dimen/button_padding_vertical"
+        android:paddingBottom="@dimen/button_padding_vertical" />
+
+    <Button
+        android:id="@+id/btnListBackups"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:minHeight="@dimen/button_min_height"
+        android:text="@string/settings_list_backups"
+        android:textAllCaps="false"
+        android:layout_marginTop="4dp"
+        android:paddingTop="@dimen/button_padding_vertical"
+        android:paddingBottom="@dimen/button_padding_vertical" />
+
+    <Button
+        android:id="@+id/btnDeleteOldBackups"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:minHeight="@dimen/button_min_height"
+        android:text="@string/settings_delete_old_backups"
+        android:textAllCaps="false"
+        android:layout_marginTop="4dp"
+        android:paddingTop="@dimen/button_padding_vertical"
+        android:paddingBottom="@dimen/button_padding_vertical" />
+
+</LinearLayout>

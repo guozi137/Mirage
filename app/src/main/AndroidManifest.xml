@@ -1,7 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- 网络权限 -->
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!--
+        自定义权限：允许授权应用控制 Mirage 配置（重载配置、清除缓存等）。
+        保护级别为 signature，仅与 Mirage 使用相同签名的应用可获此权限。
+        外部应用如需通过广播控制 Mirage 配置，必须声明并使用此权限。
+    -->
+    <permission
+        android:name="wx.mirage.permission.CONTROL"
+        android:protectionLevel="signature"
+        android:label="@string/permission_control_label"
+        android:description="@string/permission_control_desc" />
+
+    <!-- 使用自定义权限（自身也需要） -->
+    <uses-permission android:name="wx.mirage.permission.CONTROL" />
 
     <application
         android:allowBackup="false"
@@ -17,6 +32,35 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".ui.SettingsActivity"
+            android:exported="false"
+            android:label="@string/settings_title"
+            android:parentActivityName=".ui.MainActivity">
+            <intent-filter>
+                <action android:name="wx.mirage.action.SETTINGS" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!--
+            ConfigReceiver - 配置广播接收器
+            使用自定义权限 wx.mirage.permission.CONTROL 保护，
+            仅允许持有该权限的应用（相同签名）发送广播。
+            线程安全：BroadcastReceiver.onReceive() 在主线程调用，
+            不阻塞执行，耗时操作由各 Handler 方法内部处理。
+        -->
+        <receiver
+            android:name=".receiver.ConfigReceiver"
+            android:exported="true"
+            android:permission="wx.mirage.permission.CONTROL">
+            <intent-filter>
+                <action android:name="wx.mirage.action.RELOAD_CONFIG" />
+                <action android:name="wx.mirage.action.CLEAR_DEXKIT_CACHE" />
+                <action android:name="wx.mirage.action.FORCE_RELOAD_HOOKS" />
+            </intent-filter>
+        </receiver>
 
         <!-- Xposed 模块声明 -->
         <meta-data

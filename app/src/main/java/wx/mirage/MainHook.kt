@@ -4,17 +4,20 @@ import android.content.Context
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
 import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import org.luckypray.dexkit.DexKitBridge
 import wx.mirage.config.ConfigManager
+import wx.mirage.config.HookStatus
 import wx.mirage.hook.ContactHook
 import wx.mirage.hook.ConversationHook
 import wx.mirage.hook.MomentsHook
 import wx.mirage.hook.NotificationHook
 import wx.mirage.hook.GroupMemberHook
 import wx.mirage.hook.SearchHook
+import wx.mirage.lifecycle.HookLifecycleListener
+import wx.mirage.receiver.ConfigReceiver
+import wx.mirage.util.LogUtil
 
 /**
  * Mirage - 微信好友隐身 Xposed 模块
@@ -25,102 +28,162 @@ import wx.mirage.hook.SearchHook
  * 3. 通过 Hook WeChat MMApplicationLike.onCreate 确保早期注入
  * 4. 多进程检测，仅在主进程 (com.tencent.mm) 中工作
  * 5. 提供 DexKit 失败时的降级机制
+ * 6. DexKit 生命周期管理（创建/关闭/状态追踪）
+ * 7. 带重试的 Hook 注册机制
  */
 class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     companion object {
-        const val TAG = "Mirage"
-
-        /** 模块 APK 路径，在 initZygote 中设置 */
-        var modulePath: String? = null
-            private set
-
-        /** DexKit 实例，用于动态查找微信混淆类和方法 */
+        /**
+         * DexKit 实例，用于动态查找微信混淆类和方法。
+         * 线程安全：标记为 @Volatile，保证跨线程可见性。
+         * 写入仅在初始化时发生一次（handleLoadPackage -> initializeDexKit），
+         * 读取在多个 Hook 线程中频繁发生，@Volatile 确保每次读取都能看到最新值。
+         */
+        @JvmStatic
+        @Volatile
         lateinit var dexKitBridge: DexKitBridge
             private set
 
-        /** DexKit 是否初始化成功 */
+        /**
+         * DexKit 是否初始化成功。
+         * 线程安全：标记为 @Volatile，保证多线程可见性。
+         * 写入仅在 initializeDexKit() 中发生（单线程），
+         * 读取在多个 Hook 模块中发生。
+         */
+        @JvmStatic
+        @Volatile
         var dexKitAvailable: Boolean = false
             private set
 
-        /** 微信 Application Context */
+        /**
+         * DexKit 是否已关闭。
+         * 线程安全：标记为 @Volatile，保证 shutdownDexKit() 中的写入
+         * 对其他线程的读取可见。
+         */
+        @JvmStatic
+        @Volatile
+        var dexKitClosed: Boolean = false
+            private set
+
+        /**
+         * 微信 Application Context。
+         * 线程安全：标记为 @Volatile，保证在 Hook 线程中写入后
+         * 其他线程（如 UI 线程）能立即读取到最新值。
+         */
+        @JvmStatic
+        @Volatile
         var appContext: Context? = null
             private set
 
-        /** 当前加载的 LoadPackageParam */
+        /**
+         * 当前加载的 LoadPackageParam。
+         * 线程安全：标记为 @Volatile。写入在 handleLoadPackage 中
+         * 发生一次（主线程），读取主要在 Hook 模块初始化时。
+         */
+        @JvmStatic
+        @Volatile
         lateinit var lpparam: XC_LoadPackage.LoadPackageParam
             private set
 
-        /** 所有 Hook 是否已注册 */
+        /**
+         * 所有 Hook 是否已注册。
+         * 线程安全：标记为 @Volatile。写入在 registerAllHooks() 中
+         * （单线程），读取可能在多个 Hook 回调线程中发生。
+         * 注意：写入操作不是原子的，但此处的语义是"标记状态"，
+         * 不需要强制原子性。
+         */
+        @JvmStatic
+        @Volatile
         var hooksRegistered: Boolean = false
             private set
 
-        // ========== 微信包名和进程名常量 ==========
-        const val WECHAT_PACKAGE = "com.tencent.mm"
-        const val WECHAT_MAIN_PROCESS = "com.tencent.mm"
+        /**
+         * 模块是否已关闭。
+         * 线程安全：标记为 @Volatile，保证 shutdown() 中的写入
+         * 对其他线程的读取可见。shutdown() 内部使用 isShutdown 检查
+         * 防止重复关闭，但此检查不是原子的，在极端并发场景下
+         * 可能发生重复关闭。不过 shutdown 操作是幂等的，重复执行安全。
+         */
+        @JvmStatic
+        @Volatile
+        var isShutdown: Boolean = false
+            private set
 
-        // ========== 真实 WeChat Application 类名（来自 APK 分析） ==========
-        const val WECHAT_APP_CLASS = "com.tencent.mm.app.MMApplicationLike"
+        /**
+         * 模块启动时间戳（毫秒），用于计算 uptime。
+         * 线程安全：标记为 @Volatile。写入在 handleLoadPackage 中
+         * 发生一次，读取在 UI 线程中。
+         */
+        @JvmStatic
+        @Volatile
+        var startupTimestamp: Long = 0L
+            private set
 
-        // ========== WAuxiliary 验证过的微信关键包名 ==========
-        const val WECHAT_CHATTING_COMPONENT = "com.tencent.mm.ui.chatting.component"
-        const val WECHAT_CHATTING_GALLERY = "com.tencent.mm.ui.chatting.gallery"
-        const val WECHAT_PLUGIN_GALLERY = "com.tencent.mm.plugin.gallery"
-        const val WECHAT_PLUGIN_SNS = "com.tencent.mm.plugin.sns"
-        const val WECHAT_PLUGIN_FTS = "com.tencent.mm.plugin.fts"
-        const val WECHAT_PLUGIN_LOCATION = "com.tencent.mm.plugin.location"
-        const val WECHAT_UI_CONTACT = "com.tencent.mm.ui.contact"
-        const val WECHAT_UI_CONVERSATION = "com.tencent.mm.ui.conversation"
+        /**
+         * 模块总体 Hook 状态。
+         * 线程安全：标记为 @Volatile，保证跨线程可见性。
+         */
+        @JvmStatic
+        @Volatile
+        var hookStatus: HookStatus = HookStatus.INACTIVE
+            private set
 
-        // ========== 各子进程名（用于多进程检测） ==========
-        val WECHAT_SUB_PROCESSES = setOf(
-            ":push",
-            ":tools",
-            ":support",
-            ":sandbox",
-            ":exdevice",
-            ":appbrand",
-            ":normsg",
-            ":finder",
-            ":game",
-            ":snsad",
-            ":appbrand0",
-            ":appbrand1",
-            ":appbrand2",
-            ":appbrand3",
-            ":appbrand4"
-        )
+        /** 模块 APK 路径，在 initZygote 中设置 */
+        @JvmStatic
+        var modulePath: String? = null
+            private set
     }
 
     /**
      * Zygote 初始化阶段回调
-     * 在 Zygote 进程中执行，用于获取模块 APK 路径
+     *
+     * 在 Zygote 进程中执行，用于获取模块 APK 路径。
+     * 此回调在所有 Xposed 模块的 initZygote 中最早执行，
+     * 用于设置模块路径供后续 DexKit 初始化使用。
+     *
+     * @param startupParam Zygote 启动参数，包含模块路径等信息
      */
     override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
         modulePath = startupParam.modulePath
-        XposedBridge.log("$TAG: [initZygote] modulePath=${startupParam.modulePath}")
-        XposedBridge.log("$TAG: [initZygote] Mirage v1.0.1 - Zygote initialized")
+        LogUtil.i(Constants.MODULE_TAG, "modulePath=${startupParam.modulePath}")
+        LogUtil.i(Constants.MODULE_TAG, "Mirage v${Constants.VERSION} - Zygote initialized")
     }
 
     /**
-     * 加载包回调 (Xposed 主入口)
-     * 仅在微信主进程中进行注入
+     * Xposed 加载包回调
+     *
+     * 仅在微信主进程（com.tencent.mm）中执行 Hook 初始化。
+     * 执行流程：
+     * 1. 检查目标进程是否为微信主进程
+     * 2. 执行版本兼容性检查
+     * 3. 初始化修复工具
+     * 4. 初始化 DexKit
+     * 5. 初始化 ConfigManager
+     * 6. 注册所有 Hook 模块
+     * 7. 注册广播接收器
+     *
+     * @param lpparam 加载包参数，包含包名、ClassLoader 等信息
      */
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         // 仅注入微信包
-        if (lpparam.packageName != WECHAT_PACKAGE) return
+        if (lpparam.packageName != Constants.WECHAT_PACKAGE) return
 
         // 多进程检测：仅注入主进程
         val processName = lpparam.processName
-        XposedBridge.log("$TAG: [handleLoadPackage] packageName=${lpparam.packageName}, processName=$processName")
+        LogUtil.i(Constants.MODULE_TAG, "packageName=${lpparam.packageName}, processName=$processName")
 
         if (!isWeChatMainProcess(processName)) {
-            XposedBridge.log("$TAG: [handleLoadPackage] Skipping sub-process: $processName")
+            LogUtil.i(Constants.MODULE_TAG, "Skipping sub-process: $processName")
             return
         }
 
-        XposedBridge.log("$TAG: [handleLoadPackage] ========== Injecting into WeChat main process ==========")
+        LogUtil.i(Constants.MODULE_TAG, "========== Injecting into WeChat main process ==========")
         this.lpparam = lpparam
+        startupTimestamp = System.currentTimeMillis()
+
+        // 版本兼容性检查
+        checkVersionCompatibility(lpparam)
 
         try {
             // 步骤 1: 初始化 DexKit
@@ -128,18 +191,22 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
             // 步骤 2: 加载配置
             ConfigManager.init(lpparam.packageName)
-            XposedBridge.log("$TAG: [handleLoadPackage] ConfigManager initialized")
+            LogUtil.i(Constants.MODULE_TAG, "ConfigManager initialized")
 
             // 步骤 3: Hook MMApplicationLike.onCreate - 在微信 Application 创建时注册所有 Hook
             hookWeChatApplication(lpparam)
 
-            XposedBridge.log("$TAG: [handleLoadPackage] Hook initialization chain complete")
+            LogUtil.i(Constants.MODULE_TAG, "Hook initialization chain complete")
 
         } catch (e: Throwable) {
-            XposedBridge.log("$TAG: [handleLoadPackage] CRITICAL ERROR during initialization: ${e.message}")
-            XposedBridge.log(e)
+            LogUtil.e(Constants.MODULE_TAG, "CRITICAL ERROR during initialization: ${e.message}", e)
+            hookStatus = HookStatus.ERROR
         }
     }
+
+    // ========================================================================
+    // DexKit 生命周期管理
+    // ========================================================================
 
     /**
      * 初始化 DexKit
@@ -149,16 +216,229 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         try {
             val appInfo = lpparam.appInfo
             val sourceDir = appInfo.sourceDir
-            XposedBridge.log("$TAG: [DexKit] Initializing with sourceDir=$sourceDir")
+            LogUtil.i("${Constants.MODULE_TAG}:DexKit", "Initializing with sourceDir=$sourceDir")
 
             dexKitBridge = DexKitBridge.create(sourceDir)
             dexKitAvailable = true
-            XposedBridge.log("$TAG: [DexKit] Initialization SUCCESS")
+            dexKitClosed = false
+            LogUtil.i("${Constants.MODULE_TAG}:DexKit", "Initialization SUCCESS")
 
         } catch (e: Throwable) {
-            XposedBridge.log("$TAG: [DexKit] Initialization FAILED: ${e.message}")
-            XposedBridge.log("$TAG: [DexKit] Will use fallback direct class loading strategy")
+            LogUtil.e("${Constants.MODULE_TAG}:DexKit", "Initialization FAILED: ${e.message}")
+            LogUtil.w("${Constants.MODULE_TAG}:DexKit", "Will use fallback direct class loading strategy")
             dexKitAvailable = false
+            dexKitClosed = false
+        }
+    }
+
+    /**
+     * 关闭 DexKit 桥接，释放资源
+     * 在模块卸载或微信进程退出前调用
+     */
+    @JvmStatic
+    fun shutdownDexKit() {
+        if (dexKitClosed) {
+            LogUtil.d(Constants.MODULE_TAG, "DexKit already closed, skipping")
+            return
+        }
+
+        LogUtil.i(Constants.MODULE_TAG, "Shutting down DexKit bridge...")
+        try {
+            if (dexKitAvailable) {
+                dexKitBridge.close()
+                LogUtil.i(Constants.MODULE_TAG, "DexKit bridge closed successfully")
+            }
+        } catch (e: Throwable) {
+            LogUtil.e(Constants.MODULE_TAG, "Error closing DexKit bridge: ${e.message}", e)
+        } finally {
+            dexKitClosed = true
+            dexKitAvailable = false
+        }
+    }
+
+    // ========================================================================
+    // 模块关闭与资源清理
+    // ========================================================================
+
+    /**
+     * 关闭模块，释放所有资源。
+     *
+     * 执行流程：
+     * 1. 关闭 DexKit 桥接
+     * 2. 清除所有 Hook 模块的 DexKit 缓存
+     * 3. 通知所有 Hook 模块执行卸载回调（onHookUnregistered）
+     * 4. 清理 ConfigReceiver 资源
+     * 5. 清除 Context 引用
+     * 6. 重置状态标志
+     *
+     * 每个步骤独立 try-catch，防止单个步骤失败导致整体 shutdown 不完整。
+     * 此方法可安全地多次调用，后续调用会被忽略（isShutdown 检查）。
+     */
+    @JvmStatic
+    fun shutdown() {
+        if (isShutdown) {
+            LogUtil.d(Constants.MODULE_TAG, "Module already shut down, skipping")
+            return
+        }
+
+        LogUtil.i(Constants.MODULE_TAG, "========== Shutting down Mirage module ==========")
+
+        try {
+            // 1. 关闭 DexKit
+            shutdownDexKit()
+
+            // 2. 清除所有 Hook 模块的 DexKit 缓存
+            clearAllDexKitCaches()
+
+            // 3. 通知所有 Hook 模块卸载
+            notifyHookUnregistered()
+
+            // 4. 清理 BroadcastReceiver 资源
+            try {
+                ConfigReceiver().cleanup()
+            } catch (e: Throwable) {
+                LogUtil.w(Constants.MODULE_TAG, "Error cleaning up ConfigReceiver: ${e.message}")
+            }
+
+            // 5. 清除引用
+            appContext = null
+
+            // 6. 重置状态
+            hooksRegistered = false
+            isShutdown = true
+            hookStatus = HookStatus.INACTIVE
+
+            LogUtil.i(Constants.MODULE_TAG, "========== Mirage module shut down complete ==========")
+        } catch (e: Throwable) {
+            LogUtil.e(Constants.MODULE_TAG, "Error during shutdown: ${e.message}", e)
+        }
+    }
+
+    /**
+     * 清除所有 Hook 模块中的 DexKit 缓存
+     */
+    private fun clearAllDexKitCaches() {
+        try {
+            ContactHook.clearDexKitCache()
+            ConversationHook.clearDexKitCache()
+            GroupMemberHook.clearDexKitCache()
+            MomentsHook.clearDexKitCache()
+            NotificationHook.clearDexKitCache()
+            SearchHook.clearDexKitCache()
+            LogUtil.d(Constants.MODULE_TAG, "All DexKit caches cleared")
+        } catch (e: Throwable) {
+            LogUtil.w(Constants.MODULE_TAG, "Error clearing DexKit caches: ${e.message}")
+        }
+    }
+
+    /**
+     * 通知所有 Hook 模块执行卸载回调。
+     * 每个模块独立 try-catch，确保单个模块失败不影响其他模块的清理。
+     */
+    private fun notifyHookUnregistered() {
+        try {
+            LogUtil.i(Constants.MODULE_TAG, "Notifying all Hook modules of unregistration...")
+            val hooks = listOf(
+                ContactHook as HookLifecycleListener,
+                ConversationHook as HookLifecycleListener,
+                GroupMemberHook as HookLifecycleListener,
+                MomentsHook as HookLifecycleListener,
+                NotificationHook as HookLifecycleListener,
+                SearchHook as HookLifecycleListener
+            )
+            for (hook in hooks) {
+                try {
+                    hook.onHookUnregistered()
+                } catch (e: Throwable) {
+                    LogUtil.w(Constants.MODULE_TAG, "Error in onHookUnregistered for ${hook.javaClass.simpleName}: ${e.message}")
+                }
+            }
+            LogUtil.i(Constants.MODULE_TAG, "All Hook modules notified of unregistration")
+        } catch (e: Throwable) {
+            LogUtil.w(Constants.MODULE_TAG, "Error notifying hooks: ${e.message}")
+        }
+    }
+
+    // ========================================================================
+    // 带重试的 Hook 注册机制
+    // ========================================================================
+
+    /**
+     * 带重试机制的 Hook 注册
+     *
+     * 如果目标类尚未加载，会等待指定时间后重试，最多重试 [Constants.MAX_HOOK_RETRY_COUNT] 次。
+     * 适用于微信某些延迟加载的类。
+     *
+     * @param className 目标类全限定名
+     * @param classLoader 类加载器
+     * @param hookAction 注册 Hook 的具体操作（接收 Class 对象作为参数）
+     * @return 是否成功注册 Hook
+     */
+    @JvmStatic
+    fun registerHookWithRetry(
+        className: String,
+        classLoader: ClassLoader,
+        hookAction: (Class<*>) -> Unit
+    ): Boolean {
+        LogUtil.d(Constants.MODULE_TAG, "registerHookWithRetry: attempting to hook $className")
+
+        for (attempt in 1..Constants.MAX_HOOK_RETRY_COUNT) {
+            try {
+                val clazz = classLoader.loadClass(className)
+                hookAction(clazz)
+                LogUtil.i(Constants.MODULE_TAG, "registerHookWithRetry: $className hooked on attempt $attempt")
+                return true
+            } catch (e: ClassNotFoundException) {
+                if (attempt < Constants.MAX_HOOK_RETRY_COUNT) {
+                    LogUtil.d(
+                        Constants.MODULE_TAG,
+                        "registerHookWithRetry: $className not found on attempt $attempt, retrying in ${Constants.HOOK_RETRY_DELAY_MS}ms..."
+                    )
+                    try {
+                        Thread.sleep(Constants.HOOK_RETRY_DELAY_MS)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        LogUtil.w(Constants.MODULE_TAG, "registerHookWithRetry: interrupted during retry delay")
+                        return false
+                    }
+                } else {
+                    LogUtil.w(
+                        Constants.MODULE_TAG,
+                        "registerHookWithRetry: $className not found after ${Constants.MAX_HOOK_RETRY_COUNT} attempts, giving up"
+                    )
+                }
+            } catch (e: Throwable) {
+                LogUtil.e(
+                    Constants.MODULE_TAG,
+                    "registerHookWithRetry: failed to hook $className on attempt $attempt: ${e.message}",
+                    e
+                )
+                return false
+            }
+        }
+
+        return false
+    }
+
+    /**
+     * 带重试机制的 Hook 注册（重载版本，接受 Runnable）
+     *
+     * 适用于不需要传递 Class 对象，只需执行 Hook 操作的场景。
+     * 内部会尝试加载 className 来检测类是否可用，然后执行 hookAction。
+     *
+     * @param className 目标类全限定名（用于检测类是否已加载）
+     * @param classLoader 类加载器
+     * @param hookAction 注册 Hook 的具体操作
+     * @return 是否成功注册 Hook
+     */
+    @JvmStatic
+    fun registerHookWithRetry(
+        className: String,
+        classLoader: ClassLoader,
+        hookAction: Runnable
+    ): Boolean {
+        return registerHookWithRetry(className, classLoader) { _ ->
+            hookAction.run()
         }
     }
 
@@ -171,25 +451,25 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
      */
     private fun hookWeChatApplication(lpparam: XC_LoadPackage.LoadPackageParam) {
         val classLoader = lpparam.classLoader
-        XposedBridge.log("$TAG: [hookWeChatApplication] Attempting to hook $WECHAT_APP_CLASS")
+        LogUtil.i(Constants.MODULE_TAG, "Attempting to hook ${Constants.WECHAT_APP_CLASS}")
 
         try {
             // 尝试加载 MMApplicationLike 类
             val appClass = try {
-                classLoader.loadClass(WECHAT_APP_CLASS)
+                classLoader.loadClass(Constants.WECHAT_APP_CLASS)
             } catch (e: ClassNotFoundException) {
-                XposedBridge.log("$TAG: [hookWeChatApplication] $WECHAT_APP_CLASS not found, trying generic fallback")
+                LogUtil.i(Constants.MODULE_TAG, "${Constants.WECHAT_APP_CLASS} not found, trying generic fallback")
                 // 降级：尝试查找任何包含 "MMApplicationLike" 的类
                 findWeChatAppClassFallback(classLoader)
             }
 
             if (appClass == null) {
-                XposedBridge.log("$TAG: [hookWeChatApplication] Could not find WeChat Application class, using android.app.Application")
+                LogUtil.i(Constants.MODULE_TAG, "Could not find WeChat Application class, using android.app.Application")
                 hookGenericApplication(classLoader, lpparam)
                 return
             }
 
-            XposedBridge.log("$TAG: [hookWeChatApplication] Found WeChat App class: ${appClass.name}")
+            LogUtil.i(Constants.MODULE_TAG, "Found WeChat App class: ${appClass.name}")
 
             // Hook onCreate 方法
             XposedHelpers.findAndHookMethod(
@@ -197,37 +477,36 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 "onCreate",
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        XposedBridge.log("$TAG: [MMApplicationLike.onCreate] beforeHook - preparing to register hooks")
+                        LogUtil.d(Constants.MODULE_TAG, "MMApplicationLike.onCreate beforeHook - preparing to register hooks")
                     }
 
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        XposedBridge.log("$TAG: [MMApplicationLike.onCreate] afterHook - registering all hooks")
+                        LogUtil.d(Constants.MODULE_TAG, "MMApplicationLike.onCreate afterHook - registering all hooks")
 
                         try {
                             // 获取 Application Context
                             val app = XposedHelpers.callMethod(param.thisObject, "getApplication") as? Context
                             if (app != null) {
                                 appContext = app.applicationContext
-                                XposedBridge.log("$TAG: [MMApplicationLike.onCreate] appContext obtained: ${appContext != null}")
+                                LogUtil.i(Constants.MODULE_TAG, "appContext obtained: ${appContext != null}")
                             }
 
                             // 注册所有业务 Hook
                             registerAllHooks(lpparam)
 
-                            XposedBridge.log("$TAG: [MMApplicationLike.onCreate] ========== All hooks registered SUCCESS ==========")
+                            LogUtil.i(Constants.MODULE_TAG, "========== All hooks registered SUCCESS ==========")
                         } catch (e: Throwable) {
-                            XposedBridge.log("$TAG: [MMApplicationLike.onCreate] Failed to register hooks: ${e.message}")
-                            XposedBridge.log(e)
+                            LogUtil.e(Constants.MODULE_TAG, "Failed to register hooks: ${e.message}", e)
                         }
                     }
                 }
             )
 
-            XposedBridge.log("$TAG: [hookWeChatApplication] Successfully hooked MMApplicationLike.onCreate")
+            LogUtil.i(Constants.MODULE_TAG, "Successfully hooked MMApplicationLike.onCreate")
 
         } catch (e: Throwable) {
-            XposedBridge.log("$TAG: [hookWeChatApplication] Failed to hook WeChat Application: ${e.message}")
-            XposedBridge.log("$TAG: [hookWeChatApplication] Attempting fallback to android.app.Application")
+            LogUtil.e(Constants.MODULE_TAG, "Failed to hook WeChat Application: ${e.message}")
+            LogUtil.i(Constants.MODULE_TAG, "Attempting fallback to android.app.Application")
             // 降级方案：Hook 通用的 Application.attach
             hookGenericApplication(classLoader, lpparam)
         }
@@ -238,7 +517,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
      * 当 MMApplicationLike 无法找到时使用
      */
     private fun hookGenericApplication(classLoader: ClassLoader, lpparam: XC_LoadPackage.LoadPackageParam) {
-        XposedBridge.log("$TAG: [hookGenericApplication] Using generic Application.attach fallback")
+        LogUtil.i(Constants.MODULE_TAG, "Using generic Application.attach fallback")
 
         try {
             XposedHelpers.findAndHookMethod(
@@ -248,25 +527,24 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 Context::class.java,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        XposedBridge.log("$TAG: [Application.attach] beforeHook")
+                        LogUtil.d(Constants.MODULE_TAG, "Application.attach beforeHook")
                         appContext = param.args[0] as? Context
                     }
 
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        XposedBridge.log("$TAG: [Application.attach] afterHook - registering hooks via fallback")
+                        LogUtil.d(Constants.MODULE_TAG, "Application.attach afterHook - registering hooks via fallback")
 
                         try {
                             registerAllHooks(lpparam)
-                            XposedBridge.log("$TAG: [Application.attach] ========== All hooks registered (fallback) ==========")
+                            LogUtil.i(Constants.MODULE_TAG, "========== All hooks registered (fallback) ==========")
                         } catch (e: Throwable) {
-                            XposedBridge.log("$TAG: [Application.attach] Failed to register hooks: ${e.message}")
-                            XposedBridge.log(e)
+                            LogUtil.e(Constants.MODULE_TAG, "Failed to register hooks: ${e.message}", e)
                         }
                     }
                 }
             )
         } catch (e: Throwable) {
-            XposedBridge.log("$TAG: [hookGenericApplication] CRITICAL: Failed to hook Application.attach: ${e.message}")
+            LogUtil.e(Constants.MODULE_TAG, "CRITICAL: Failed to hook Application.attach: ${e.message}")
         }
     }
 
@@ -275,7 +553,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
      * 当精确类名查找失败时，通过类名包含关系查找
      */
     private fun findWeChatAppClassFallback(classLoader: ClassLoader): Class<*>? {
-        XposedBridge.log("$TAG: [findWeChatAppClassFallback] Searching for WeChat App class...")
+        LogUtil.i(Constants.MODULE_TAG, "Searching for WeChat App class...")
 
         val candidates = listOf(
             "com.tencent.mm.app.MMApplicationLike",
@@ -287,55 +565,76 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         for (candidate in candidates) {
             try {
                 val clazz = classLoader.loadClass(candidate)
-                XposedBridge.log("$TAG: [findWeChatAppClassFallback] Found: $candidate")
+                LogUtil.i(Constants.MODULE_TAG, "Found: $candidate")
                 return clazz
             } catch (_: Throwable) {
                 // 继续尝试
             }
         }
 
-        XposedBridge.log("$TAG: [findWeChatAppClassFallback] No WeChat App class found")
+        LogUtil.i(Constants.MODULE_TAG, "No WeChat App class found")
         return null
     }
 
     /**
-     * 统一注册所有业务 Hook
+     * 注册所有 Hook 模块。
+     *
+     * 按顺序注册 ContactHook -> ConversationHook -> MomentsHook ->
+     * NotificationHook -> SearchHook -> GroupMemberHook。
+     * 每个模块独立 try-catch，单个模块失败不影响其他模块的注册。
+     * 注册完成后，所有模块的 init() 方法会调用 onHookRegistered() 回调。
+     *
+     * @param lpparam Xposed LoadPackage 参数
+     * @return true 如果至少有一个 Hook 模块注册成功，false 如果全部失败
      */
-    private fun registerAllHooks(lpparam: XC_LoadPackage.LoadPackageParam) {
+    @JvmStatic
+    fun registerAllHooks(lpparam: XC_LoadPackage.LoadPackageParam): Boolean {
         if (hooksRegistered) {
-            XposedBridge.log("$TAG: [registerAllHooks] Hooks already registered, skipping")
-            return
+            LogUtil.i(Constants.MODULE_TAG, "Hooks already registered, skipping")
+            return true
         }
 
-        XposedBridge.log("$TAG: [registerAllHooks] Starting hook registration...")
+        LogUtil.i(Constants.MODULE_TAG, "Starting hook registration...")
 
         // 按顺序注册各模块 Hook，每个模块独立 try-catch，互不影响
         val hookModules = listOf(
-            Triple("ContactHook") { ContactHook.init(lpparam) },
-            Triple("ConversationHook") { ConversationHook.init(lpparam) },
-            Triple("MomentsHook") { MomentsHook.init(lpparam) },
-            Triple("NotificationHook") { NotificationHook.init(lpparam) },
-            Triple("SearchHook") { SearchHook.init(lpparam) },
-            Triple("GroupMemberHook") { GroupMemberHook.init(lpparam) }
+            Triple("ContactHook", { ContactHook.init(lpparam) }, ContactHook as HookLifecycleListener),
+            Triple("ConversationHook", { ConversationHook.init(lpparam) }, ConversationHook as HookLifecycleListener),
+            Triple("MomentsHook", { MomentsHook.init(lpparam) }, MomentsHook as HookLifecycleListener),
+            Triple("NotificationHook", { NotificationHook.init(lpparam) }, NotificationHook as HookLifecycleListener),
+            Triple("SearchHook", { SearchHook.init(lpparam) }, SearchHook as HookLifecycleListener),
+            Triple("GroupMemberHook", { GroupMemberHook.init(lpparam) }, GroupMemberHook as HookLifecycleListener)
         )
 
         var successCount = 0
         var failCount = 0
 
-        for ((name, initFn) in hookModules) {
+        for ((name, initFn, lifecycleListener) in hookModules) {
             try {
                 initFn()
                 successCount++
-                XposedBridge.log("$TAG: [registerAllHooks] $name registered OK")
+                LogUtil.i(Constants.MODULE_TAG, "$name registered OK")
             } catch (e: Throwable) {
                 failCount++
-                XposedBridge.log("$TAG: [registerAllHooks] $name FAILED: ${e.message}")
-                XposedBridge.log(e)
+                LogUtil.e(Constants.MODULE_TAG, "$name FAILED: ${e.message}", e)
+                try {
+                    lifecycleListener.onHookFailed(e)
+                } catch (_: Throwable) {
+                    // 生命周期回调本身不应影响主流程
+                }
             }
         }
 
         hooksRegistered = true
-        XposedBridge.log("$TAG: [registerAllHooks] Done - $successCount success, $failCount failed")
+        hookStatus = if (failCount == 0) {
+            if (dexKitAvailable) HookStatus.ACTIVE else HookStatus.DEGRADED
+        } else if (successCount > 0) {
+            HookStatus.DEGRADED
+        } else {
+            HookStatus.ERROR
+        }
+        LogUtil.i(Constants.MODULE_TAG, "Done - $successCount success, $failCount failed (status: ${hookStatus.description})")
+        return successCount > 0
     }
 
     /**
@@ -346,23 +645,85 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
      */
     private fun isWeChatMainProcess(processName: String): Boolean {
         // 主进程名就是包名本身
-        if (processName == WECHAT_MAIN_PROCESS) return true
+        if (processName == Constants.WECHAT_MAIN_PROCESS) return true
 
         // 检查是否包含冒号（子进程特征）
         if (processName.contains(":")) {
-            XposedBridge.log("$TAG: [isWeChatMainProcess] Detected sub-process: $processName")
+            LogUtil.d(Constants.MODULE_TAG, "Detected sub-process: $processName")
             return false
         }
 
         // 安全起见，如果不是子进程格式，也当作主进程处理
-        XposedBridge.log("$TAG: [isWeChatMainProcess] Unknown process pattern: $processName, treating as main")
-        return processName.startsWith(WECHAT_PACKAGE)
+        LogUtil.d(Constants.MODULE_TAG, "Unknown process pattern: $processName, treating as main")
+        return processName.startsWith(Constants.WECHAT_PACKAGE)
     }
 
+    // ========================================================================
+    // 版本兼容性检查
+    // ========================================================================
+
     /**
-     * 获取日志标签（带模块名）
+     * 检查当前微信版本与 Mirage 的兼容性。
+     *
+     * 根据三个级别进行判断：
+     * 1. [Constants.KNOWN_INCOMPATIBLE_VERSIONS] - 已知不兼容，输出 ERROR 级别日志
+     * 2. [Constants.FULLY_TESTED_VERSIONS] - 完全测试通过，输出 INFO 级别日志
+     * 3. [Constants.KNOWN_COMPATIBLE_VERSIONS] - 已知兼容，输出 INFO 级别日志
+     * 4. 其他 - 未测试版本，输出 WARN 级别日志
+     *
+     * 此检查不会阻止模块加载，仅用于诊断和日志记录。
+     *
+     * @param lpparam Xposed LoadPackage 参数，用于获取微信版本信息
      */
-    fun logWithModule(module: String, message: String) {
-        XposedBridge.log("$TAG: [$module] $message")
+    @JvmStatic
+    fun checkVersionCompatibility(lpparam: XC_LoadPackage.LoadPackageParam) {
+        try {
+            val appInfo = lpparam.appInfo
+            val versionName = appInfo?.versionName ?: "unknown"
+            val versionCode = appInfo?.versionCode ?: 0
+
+            LogUtil.i(Constants.MODULE_TAG, "WeChat version: $versionName (code: $versionCode)")
+
+            when {
+                // 已知不兼容
+                versionName in Constants.KNOWN_INCOMPATIBLE_VERSIONS -> {
+                    LogUtil.e(
+                        Constants.MODULE_TAG,
+                        "WARNING: WeChat version $versionName is KNOWN INCOMPATIBLE with Mirage! " +
+                        "Some features may not work correctly. " +
+                        "Please upgrade WeChat or use a compatible version."
+                    )
+                }
+                // 完全测试通过
+                versionName in Constants.FULLY_TESTED_VERSIONS -> {
+                    LogUtil.i(
+                        Constants.MODULE_TAG,
+                        "WeChat version $versionName is fully tested and compatible."
+                    )
+                }
+                // 已知兼容
+                versionName in Constants.KNOWN_COMPATIBLE_VERSIONS -> {
+                    LogUtil.i(
+                        Constants.MODULE_TAG,
+                        "WeChat version $versionName is in the known compatible list."
+                    )
+                }
+                // 未测试版本
+                else -> {
+                    LogUtil.w(
+                        Constants.MODULE_TAG,
+                        "WeChat version $versionName is UNTESTED. " +
+                        "Mirage may or may not work correctly. " +
+                        "Compatible versions: ${Constants.KNOWN_COMPATIBLE_VERSIONS.joinToString(", ")}"
+                    )
+                    LogUtil.w(
+                        Constants.MODULE_TAG,
+                        "If you encounter issues, please report them with the WeChat version."
+                    )
+                }
+            }
+        } catch (e: Throwable) {
+            LogUtil.w(Constants.MODULE_TAG, "Failed to check version compatibility: ${e.message}")
+        }
     }
 }
